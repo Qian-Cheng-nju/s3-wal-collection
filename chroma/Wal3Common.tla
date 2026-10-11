@@ -3,15 +3,21 @@
 EXTENDS Naturals, Integers, FiniteSets, FiniteSetsExt, Sequences,
         SequencesExt, TLC
 
-\* Shared vocabulary, state, and coordination for the modular Wal3 spec.
-\* Each role extends this module, so all roles use the same variable declarations.
+(*
+    Contains:
+        * constants
+        * variables
+        * shared helpers
+        * data model and TypeOK
+        * NO actions
+*)
 
 CONSTANTS Replicas, \* The set of replica processes
           Values   \* The set of values to append
 
 \* Replica states
 CONSTANTS IDLE, RECOVER, COMMIT_RECOVERED, REFRESH, READY,
-          UPLOAD_FRAGMMENT, COMMIT_FRAGMENT,
+          UPLOAD_FRAGMENT, COMMIT_FRAGMENT,
           ILLEGAL_STATE, ABORT_WRITE, PREEMPTED,
           REPLAY_WAL, COMMIT_CHECKPOINT, READ_CURSOR, COMMIT_CURSOR,
           GC_P1_READ_GC_FILE, GC_P1_COMPUTE_PLAN,
@@ -105,7 +111,7 @@ CompactionCursorType == [pos: Nat, version: Nat] \union {None}
 
 \* role states
 WriterStates == {IDLE, REFRESH, RECOVER, COMMIT_RECOVERED, READY,
-                 UPLOAD_FRAGMMENT, COMMIT_FRAGMENT, ABORT_WRITE,
+                 UPLOAD_FRAGMENT, COMMIT_FRAGMENT, ABORT_WRITE,
                  ILLEGAL_STATE, PREEMPTED}
 GcStates == {IDLE, ABORTED, PREEMPTED,
              GC_P1_READ_GC_FILE, GC_P1_COMPUTE_PLAN,
@@ -137,6 +143,14 @@ TypeOK ==
     /\ rCompCursor \in [Replicas -> CompactionCursorType]
     /\ auxUsedValues \in SUBSET Values
     /\ auxCommitted \in Seq(LogEntryType)
+
+\* ****************************************************
+\* COMMON Init
+\* ****************************************************
+
+CommonInit ==
+    /\ rManifest = [r \in Replicas |-> None]
+    /\ rManifestLocked = [r \in Replicas |-> FALSE]
 
 \* ****************************************************
 \* COMMON HELPERS

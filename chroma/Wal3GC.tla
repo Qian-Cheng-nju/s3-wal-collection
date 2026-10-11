@@ -8,6 +8,10 @@ EXTENDS Wal3Common
     3. Delete fragments  
 *)
 
+PlanApplicable(r, plan) ==
+    /\ plan.seqNoLimit >= CachedSeqNoFloor(r) + 1
+    /\ plan.seqNoLimit <= CachedSeqNoCeiling(r) + 1
+
 \* ****************************************************
 \* WAL GC ACTIONS
 \* ****************************************************
@@ -15,21 +19,28 @@ EXTENDS Wal3Common
 (* ---------------------------------------------------------
     ACTION: GcPhase1ReadCursor
 
-    DESC TODO
+    A GC run starts by reading the compaction cursor,
+    which bounds the prefix it may collect. 
+
+    Note 1. Chroma has many cursors, but this spec only
+    cares about the compaction cursor.
+
+    Note 2. We control the conditions when GC can start 
+    to avoid infinite battles between replicas (infinite
+    state space) and to avoid GC that would stop early
+    due to nothing to collect (that would also inflate
+    the state space massively).
 -----------------------------------------------------------*)
 
-\* The replica GC is idle, or we restart a GC that experienced
-\* aborted due to a conflict and there are no other
-\* functional GC tasks. This allows us to bound the
-\* number of GC retries while guaranteeing one
-\* will finish (we avoid infinite GC battles).
 InTriggerableState(r) ==
     \/ rGcState[r] = IDLE
+    \* ABORTED means a GC hit a retryable conflict. In this
+    \* spec we limit retries to one replica at a time, else it
+    \* causes infinite battles.
     \/ /\ rGcState[r] = ABORTED
        /\ ~\E r0 \in Replicas : rGcState[r0] \notin {ABORTED, PREEMPTED}
 
 \* This is not the protocol, just some state space reduction.
-\* The compaction cursor covers the WAL seqNo range.
 CompactionCursorInWalRange(r) ==
     /\ CachedFloorLogPos(r) > 0
     /\ compCursor.pos >= CachedFloorLogPos(r)
@@ -47,7 +58,8 @@ GcPhase1ReadCursor(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase1ReadGcFile
 
-    DESC TODO
+    GC reads the current GC plan before choosing what 
+    to collect. In the impl, this is the GARBAGE file.
 -----------------------------------------------------------*)
 
 GcPhase1ReadGcFile(r) ==
@@ -60,7 +72,21 @@ GcPhase1ReadGcFile(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase1ComputePlan
 
-    DESC TODO
+    Now the GC has loaded the current plan file, it
+    can take one of four sub-actions here:
+
+    1. Stop: See there is nothing to collect and stop.
+    2. Compute new plan: The existing plan is empty, 
+       so compute and persist a new plan (to S3). Then
+       move on to phase 2.
+    3. Reuse plan: The existing plan is still valid,
+       there remains GC work to do for this plan. Move
+       on to phase 2.
+    4. Reset plan: The existing plan is totally stale,
+       so clear it, persist it and restart phase 1.
+
+    (2) and (4) both pin GC plan, which is checked
+    later in phase 3.
 -----------------------------------------------------------*)
 
 \* SUB-ACTION: StopEarly ----------------------------------
@@ -115,8 +141,7 @@ SaveNewPlan(r) ==
 
 \* condition
 GcFileApplicable(r) ==
-    /\ rGcCachedPlan[r].seqNoLimit >= CachedSeqNoFloor(r) + 1
-    /\ rGcCachedPlan[r].seqNoLimit <= CachedSeqNoCeiling(r) + 1
+    PlanApplicable(r, rGcCachedPlan[r])
 
 \* action
 ReusePlan(r) ==
@@ -153,24 +178,39 @@ GcPhase1ComputePlan(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase2ReadGcFile
 
-    DESC TODO
+    GC reloads the GC plan file.
+    If the plan is no longer applicable, GC aborts.
+    Else, it locks the cached manifest for updates and
+    the GC boundary stored in the plan is retained (rGcTrimLimit)
+
+    Note: The impl serializes manifest updates (per replica) 
+    a different way but a simple manifest lock works better
+    for this spec. Basically replica-local GC and WAL writer
+    can attempt to concurrently update and commit the manifest.
 -----------------------------------------------------------*)
+
+AbortInPhase2(r) ==
+    /\ rGcState' = [rGcState EXCEPT ![r] = ABORTED]
+    /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = FALSE]
+    /\ UNCHANGED <<rGcCachedPlan, rGcTrimLimit>>
 
 GcPhase2ReadGcFile(r) ==
     /\ rGcState[r] = GC_P2_READ_GC_FILE
-    /\ rGcCachedPlan' = [rGcCachedPlan EXCEPT ![r] = gcPlanFile]
-    \* Phase 2 independently reloads the plan and serializes this replica's
-    \* manifest update. The phase 1 plan remains pinned for phase 3 deletion.
-    /\ rGcTrimLimit' = [rGcTrimLimit EXCEPT ![r] = gcPlanFile.seqNoLimit]
-    /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = TRUE]
-    /\ rGcState' = [rGcState EXCEPT ![r] = GC_P2_CAS_MANIFEST]
+    /\ IF ~PlanApplicable(r, gcPlanFile)
+       THEN AbortInPhase2(r)
+       ELSE /\ rGcCachedPlan' = [rGcCachedPlan EXCEPT ![r] = gcPlanFile]
+            /\ rGcTrimLimit' = [rGcTrimLimit EXCEPT ![r] = gcPlanFile.seqNoLimit]
+            /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = TRUE]
+            /\ rGcState' = [rGcState EXCEPT ![r] = GC_P2_CAS_MANIFEST]
     /\ UNCHANGED <<storeVars, auxVars, rManifest, repWriterVars,
                    repCompVars, rGcCompCursor, rGcPinnedPlan>>
 
 (* ---------------------------------------------------------
     ACTION: GcPhase2CasManifest
 
-    DESC TODO
+    GC removes fragment references below the trim GC boundary
+    and attempts CAS the manifest in S3. A conflict preempts
+    writer and GC; else it transitions to phase 3.
 -----------------------------------------------------------*)
 
 TrimmedFragRefs(r) ==
@@ -181,36 +221,29 @@ TrimmedFragRefs(r) ==
     IN IF i = Len(refs) THEN <<>>
        ELSE SubSeq(refs, i+1, Len(refs))
 
-AbortInPhase2(r) ==
-    /\ rGcState' = [rGcState EXCEPT ![r] = ABORTED]
+ManifestCasConflict(r) ==
     /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = FALSE]
-    /\ UNCHANGED <<manifest, rManifest, rWriterState>>
-
-AttemptCasWrite(r) ==
-    \/ /\ rManifest[r].version /= manifest.version
-       /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = FALSE]
-       /\ PreemptWriterAndGc(r)
-       /\ UNCHANGED <<manifest, rManifest>>
-    \/ /\ rManifest[r].version = manifest.version
-       /\ LET m            == rManifest[r]
-              trimmed      == TrimmedFragRefs(r)
-              initialPos   == IF trimmed = <<>> THEN NextPos(m) ELSE m.initialPos
-              initialSeqNo == IF trimmed = <<>> THEN NextSeqNo(m) ELSE m.initialSeqNo
-              newManifest  == [fragRefs     |-> trimmed,
-                               initialPos   |-> initialPos,
-                               initialSeqNo |-> initialSeqNo,
-                               version      |-> m.version + 1]
-          IN /\ manifest' = newManifest
-             /\ rManifest' = [rManifest EXCEPT ![r] = newManifest]
-             /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = FALSE]
-             /\ rGcState' = [rGcState EXCEPT ![r] = GC_P3_READ_GC_FILE]
-             /\ UNCHANGED rWriterState
+    /\ PreemptWriterAndGc(r)
+    /\ UNCHANGED <<manifest, rManifest>>
 
 GcPhase2CasManifest(r) ==
     /\ rGcState[r] = GC_P2_CAS_MANIFEST
-    /\ IF ~GcFileApplicable(r)
-       THEN AbortInPhase2(r)
-       ELSE AttemptCasWrite(r)
+    /\ \/ /\ rManifest[r].version /= manifest.version
+          /\ ManifestCasConflict(r)
+       \/ /\ rManifest[r].version = manifest.version
+          /\ LET m            == rManifest[r]
+                 trimmed      == TrimmedFragRefs(r)
+                 initialPos   == IF trimmed = <<>> THEN NextPos(m) ELSE m.initialPos
+                 initialSeqNo == IF trimmed = <<>> THEN NextSeqNo(m) ELSE m.initialSeqNo
+                 newManifest  == [fragRefs     |-> trimmed,
+                                  initialPos   |-> initialPos,
+                                  initialSeqNo |-> initialSeqNo,
+                                  version      |-> m.version + 1]
+             IN /\ manifest' = newManifest
+                /\ rManifest' = [rManifest EXCEPT ![r] = newManifest]
+                /\ rManifestLocked' = [rManifestLocked EXCEPT ![r] = FALSE]
+                /\ rGcState' = [rGcState EXCEPT ![r] = GC_P3_READ_GC_FILE]
+                /\ UNCHANGED rWriterState
     /\ UNCHANGED <<fragments, checkpoint, compCursor, gcPlanFile, auxVars,
                    repCompVars, rWriterPendingValues, rWriterFragment,
                    rWriterNextPos, rWriterNextSeqNo, rGcCachedPlan,
@@ -219,7 +252,8 @@ GcPhase2CasManifest(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase3ReadGcFile
 
-    DESC TODO
+    GC rereads the plan file again from S3 and aborts if 
+    its version no longer matches the plan pinned in phase 1.
 -----------------------------------------------------------*)
 
 GcPinnedPlanMatch(r) ==
@@ -239,7 +273,19 @@ GcPhase3ReadGcFile(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase3ReadManifest
 
-    DESC TODO
+    Before fragment delection can commence (state 
+    GC_P3_DELETE), the GC reads the manifest from S3
+    and checks that the pinned plan has been applied
+    to the manifest. A race can occur here where
+    one GC in Phase 1 can write a new plan, and another
+    GC in phase 3 loads that plan before the other
+    GC has trimmed the entries below the boundary.
+    Without this check against the pinned plan, a
+    GC can delete fragments still visible to readers.
+
+    If the plan has been applied to the current manifest
+    on S3, the GC transitions to GC_P3_DELETE, else
+    it aborts.
 -----------------------------------------------------------*)
 
 GcPhase3ReadManifest(r) ==
@@ -253,7 +299,7 @@ GcPhase3ReadManifest(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase3Delete
 
-    DESC TODO
+    GC deletes one fragment below the pinned plan's boundary.
 -----------------------------------------------------------*)
 
 GcPhase3Delete(r) ==
@@ -268,7 +314,9 @@ GcPhase3Delete(r) ==
 (* ---------------------------------------------------------
     ACTION: GcPhase3Complete
 
-    DESC TODO
+    After deleting the planned prefix, GC returns to idle.
+    It clears the durable plan only if it still matches
+    the pinned version.
 -----------------------------------------------------------*)
 
 GcPhase3Complete(r) ==
@@ -286,6 +334,17 @@ GcPhase3Complete(r) ==
                   auxVars, repSharedVars, repCompVars, repWriterVars,
                   rGcTrimLimit>>
 
+\* ****************************************************
+\* Init, Next and Fairness
+\* ****************************************************
+
+GcInit ==
+    /\ rGcState = [r \in Replicas |-> IDLE]
+    /\ rGcCachedPlan = [r \in Replicas |-> None]
+    /\ rGcPinnedPlan = [r \in Replicas |-> None]
+    /\ rGcTrimLimit = [r \in Replicas |-> 0]
+    /\ rGcCompCursor = [r \in Replicas |-> None]
+
 GcNext(r) ==
     \/ GcPhase1ReadCursor(r)
     \/ GcPhase1ReadGcFile(r)
@@ -296,5 +355,16 @@ GcNext(r) ==
     \/ GcPhase3ReadManifest(r)
     \/ GcPhase3Delete(r)
     \/ GcPhase3Complete(r)
+
+GcFairness(r) ==
+    /\ WF_vars(GcPhase1ReadCursor(r))
+    /\ WF_vars(GcPhase1ReadGcFile(r))
+    /\ WF_vars(GcPhase1ComputePlan(r))
+    /\ WF_vars(GcPhase2ReadGcFile(r))
+    /\ WF_vars(GcPhase2CasManifest(r))
+    /\ WF_vars(GcPhase3ReadGcFile(r))
+    /\ WF_vars(GcPhase3ReadManifest(r))
+    /\ WF_vars(GcPhase3Delete(r))
+    /\ WF_vars(GcPhase3Complete(r))
 
 =============================================================================

@@ -2,8 +2,13 @@
 
 EXTENDS Wal3Common
 
-\* Compaction protocol and its WAL read helpers. 
-\* Reads use the shared cached manifest.
+(* 
+    Compaction protocol and its WAL read helpers.
+    Compaction reads the latest WAL fragments and
+    applies them to the DB state (indexes etc) and
+    publishes that state on S3. This spec uses a more
+    abstract checkpoint as this published state.
+*)
 
 \* ****************************************************
 \* HELPERS
@@ -23,18 +28,20 @@ EndCompaction(r) ==
 \* ****************************************************
 
 (* ---------------------------------------------------------
-    ACTION: CompactorStart
+    ACTION: CompactorStart (step 1)
 
-    DESC TODO
+    The compactor loads the published checkpoint and
+    transitions to REPLAY_WAL.
+
+    Note: To reduce state space, this only triggers
+    when the WAL has advanced past the current checkpoint.
 -----------------------------------------------------------*)
 
-\* Trigger when no compaction running and WAL has
-\* started. Also to reduce state space, only trigger
-\* when the WAL has advanced past the current checkpoint
 TriggerCompaction(r) ==
     /\ rCompState[r] = IDLE
     /\ rManifest[r] /= None \* WAL writer opened
-    /\ NextSeqNo(rManifest[r])-1  > checkpoint.seqNo
+    \* something to checkpoint (not in impl)
+    /\ NextSeqNo(rManifest[r])-1  > checkpoint.seqNo 
 
 CompactorStart(r) ==
     /\ TriggerCompaction(r)
@@ -44,9 +51,16 @@ CompactorStart(r) ==
                    rCompCursor>>
 
 (* ---------------------------------------------------------
-    ACTION: CompactorReplayWAL
+    ACTION: CompactorReplayWAL (step 2)
 
-    DESC TODO
+    The compactor replays one fragment into its ongoing
+    checkpoint state. The action repeats until it reaches
+    the end of the WAL.
+
+    If an fragment file is not found, compaction aborts.
+    If we've reached the end of the WAL, transition to
+    COMMIT_CHECKPOINT.
+    Else, apply the fragment.
 -----------------------------------------------------------*)
 
 CompactorReplayWAL(r) ==
@@ -54,10 +68,14 @@ CompactorReplayWAL(r) ==
     /\ LET nextSeqNo == rCompCheckpoint[r].seqNo + 1
            frag      == WalRead(r, nextSeqNo)
        IN
-          CASE frag = NotFound -> EndCompaction(r)
+          CASE 
+            \* CASE 1: Expected fragment not found
+               frag = NotFound -> EndCompaction(r)
+            \* CASE 2: No fragment, reached end of WAL
             [] frag = None ->
                 /\ rCompState' = [rCompState EXCEPT ![r] = COMMIT_CHECKPOINT]
                 /\ UNCHANGED <<rCompCheckpoint, rCompCursor>>
+            \* CASE 3: Fragment read, apply to ongoing cp
             [] OTHER ->
                 /\ rCompCheckpoint' = [rCompCheckpoint EXCEPT 
                                             ![r].snapshot = @ \o frag.entries,
@@ -66,9 +84,12 @@ CompactorReplayWAL(r) ==
     /\ UNCHANGED <<storeVars, auxVars, repSharedVars, repWriterVars, repGcVars>>
 
 (* ---------------------------------------------------------
-    ACTION: CompactorCommitCheckpoint
+    ACTION: CompactorCommitCheckpoint (step 3)
 
-    DESC TODO
+    The compactor publishes its checkpoint by CAS.
+    On CAS conflict, abort compaction.
+    On success, transition to READ_CURSOR (first step
+    in advancing the compaction cursor).
 -----------------------------------------------------------*)
 
 CompactorCommitCheckpoint(r) ==
@@ -84,9 +105,13 @@ CompactorCommitCheckpoint(r) ==
                    auxVars, repSharedVars, repWriterVars, repGcVars>>
 
 (* ---------------------------------------------------------
-    ACTION: CompactorReadCursor
+    ACTION: CompactorReadCursor (step 4)
 
-    DESC TODO
+    The compactor reads the cursor on S3. 
+    If the cursor already matches or exceeds the current
+    checkpoint log position, then abort. Another compactor
+    already ran.
+    Else transition to COMMIT_CURSOR.
 -----------------------------------------------------------*)
 
 CompactorReadCursor(r) ==
@@ -100,9 +125,10 @@ CompactorReadCursor(r) ==
     /\ UNCHANGED <<storeVars, auxVars, repSharedVars, repWriterVars, repGcVars>>
 
 (* ---------------------------------------------------------
-    ACTION: CompactorCommitCursor
+    ACTION: CompactorCommitCursor (step 5)
 
-    DESC TODO
+    The compactor advances the cursor by CAS and ends the
+    run, whether the CAS succeeds or conflicts.
 -----------------------------------------------------------*)
 
 CompactorCommitCursor(r) ==
@@ -116,11 +142,27 @@ CompactorCommitCursor(r) ==
     /\ UNCHANGED <<manifest, fragments, checkpoint, gcPlanFile,
                    auxVars, repSharedVars, repWriterVars, repGcVars>>
 
+\* ****************************************************
+\* Init, Next and Fairness
+\* ****************************************************
+
+CompactorInit ==
+    /\ rCompState = [r \in Replicas |-> IDLE]
+    /\ rCompCheckpoint = [r \in Replicas |-> None]
+    /\ rCompCursor = [r \in Replicas |-> None]
+
 CompactorNext(r) ==
     \/ CompactorStart(r)
     \/ CompactorReplayWAL(r)
     \/ CompactorCommitCheckpoint(r)
     \/ CompactorReadCursor(r)
     \/ CompactorCommitCursor(r)
+
+CompactorFairness(r) ==
+    /\ WF_vars(CompactorStart(r))
+    /\ WF_vars(CompactorReplayWAL(r))
+    /\ WF_vars(CompactorCommitCheckpoint(r))
+    /\ WF_vars(CompactorReadCursor(r))
+    /\ WF_vars(CompactorCommitCursor(r))
 
 =============================================================================

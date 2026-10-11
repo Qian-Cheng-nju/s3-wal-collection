@@ -2,13 +2,15 @@
 
 EXTENDS Wal3Common
 
-\* WAL append and recovery protocol.
+(* 
+    WAL writer logic: append and recovery protocol.
+*)
 
 \* ****************************************************
 \* HELPERS
 \* ****************************************************
 
-UpdateWriterFromManifest(r, m) ==
+ResetAppendPosition(r, m) ==
     /\ rWriterFragment' = [rWriterFragment EXCEPT ![r] = None]
     /\ rWriterNextPos' = [rWriterNextPos EXCEPT ![r] = NextPos(m)]
     /\ rWriterNextSeqNo' = [rWriterNextSeqNo EXCEPT ![r] = NextSeqNo(m)]
@@ -22,7 +24,7 @@ CommitFragment(r) ==
     IN
         /\ manifest' = manifest0
         /\ rManifest' = [rManifest EXCEPT ![r] = manifest0]
-        /\ UpdateWriterFromManifest(r, manifest0)
+        /\ ResetAppendPosition(r, manifest0)
         /\ auxCommitted' = auxCommitted \o f.entries
         /\ UNCHANGED rManifestLocked
 
@@ -36,7 +38,8 @@ NoCommit == UNCHANGED <<manifest, repSharedVars, rWriterFragment,
 (* ---------------------------------------------------------
     ACTION: WalRefreshManifest
 
-    DESC TODO
+    The writer reloads the manifest, resets its append
+    position, and enters recovery.
 -----------------------------------------------------------*)
 
 WalRefreshManifest(r) ==
@@ -46,20 +49,34 @@ WalRefreshManifest(r) ==
     /\ ~IsManifestLocked(r)
     /\ rManifest' = [rManifest EXCEPT ![r] = manifest]
     /\ rWriterState' = [rWriterState EXCEPT ![r] = RECOVER]
-    /\ UpdateWriterFromManifest(r, manifest)
+    /\ ResetAppendPosition(r, manifest)
     /\ UNCHANGED <<storeVars, auxVars, repGcVars, repCompVars,
                    rWriterPendingValues, rManifestLocked>>
 
 (* ---------------------------------------------------------
     ACTION: WalRecover
 
-    DESC TODO
+    The writer checks the next fragment address (one
+    address beyond the last manifest registered fragment).
+    
+    If a fragment exists, then this means another replica
+    uploaded a fragment but has not yet committed it
+    (by adding its ref to the manifest). This replica now
+    transitions to COMMIT_RECOVERED to commit this
+    fragment.
+    
+    If the address is free, then no recovery is needed.
+    The next state depends on whether refresh/recovery was
+    part of an ongoing write or not. If there is an ongoing
+    write then the replica transitions to UPLOAD_FRAGMENT
+    to continue the write process, else it transitions
+    to READY where it can accept more writes.   
 -----------------------------------------------------------*)
 
 DoingWrite(r) == rWriterPendingValues[r] /= {}
 
 PostRefreshState(r) ==
-    IF DoingWrite(r) THEN UPLOAD_FRAGMMENT
+    IF DoingWrite(r) THEN UPLOAD_FRAGMENT
     ELSE READY
 
 FragmentRead(seqNo) ==
@@ -82,7 +99,12 @@ WalRecover(r) ==
 (* ---------------------------------------------------------
     ACTION: WalCommitRecoveredFragment
 
-    DESC TODO
+    The recovered fragment is added to the manifest 
+    and a CAS write is attempted.
+    A CAS conflict sends the writer back to REFRESH.
+    A success transitions the writer to READY
+    or UPLOAD_FRAGMENT depending on whether an ongoing
+    write is occurring or not.
 -----------------------------------------------------------*)
 
 WalCommitRecoveredFragment(r) ==
@@ -100,7 +122,8 @@ WalCommitRecoveredFragment(r) ==
 (* ---------------------------------------------------------
     ACTION: WalAcceptWrites
 
-    DESC TODO
+    A ready writer accepts a nonempty batch of new values
+    to write. The writer transitions to UPLOAD_FRAGMENT.
 -----------------------------------------------------------*)
 
 WalAcceptWrites(r, values) ==
@@ -108,7 +131,7 @@ WalAcceptWrites(r, values) ==
     /\ Cardinality(values) > 0
     /\ \A v \in values : v \notin auxUsedValues
     /\ rWriterPendingValues' = [rWriterPendingValues EXCEPT ![r] = values]
-    /\ rWriterState' = [rWriterState EXCEPT ![r] = UPLOAD_FRAGMMENT]
+    /\ rWriterState' = [rWriterState EXCEPT ![r] = UPLOAD_FRAGMENT]
     /\ auxUsedValues' = auxUsedValues \union values
     /\ UNCHANGED <<storeVars, auxCommitted, repGcVars, repCompVars,
                    repSharedVars, rWriterFragment, rWriterNextPos,
@@ -117,11 +140,19 @@ WalAcceptWrites(r, values) ==
 (* ---------------------------------------------------------
     ACTION: WalUploadFragment
 
-    DESC TODO
+    The writer uploads the batch as a fragment using
+    put-if-absent. 
+    The batch contains the pending values as an
+    ordered sequence, with a log position for each
+    entry.
+
+    If put-if-absent fails then another writer has written
+    to this address, so the writer transitions back to 
+    REFRESH, else it transitions to COMMIT_FRAGMENT.
 -----------------------------------------------------------*)
 
 WalUploadFragment(r) ==
-    /\ rWriterState[r] = UPLOAD_FRAGMMENT
+    /\ rWriterState[r] = UPLOAD_FRAGMENT
     /\ LET seq     == SetToSeq(rWriterPendingValues[r])
            entries == [i \in DOMAIN seq |->
                             [pos  |-> rWriterNextPos[r] + i - 1,
@@ -143,7 +174,17 @@ WalUploadFragment(r) ==
 (* ---------------------------------------------------------
     ACTION: WalCommitFragment
 
-    DESC TODO
+    The writer commits the uploaded fragment by adding
+    it to its cached manifest and performing a CAS write
+    to the manifest in S3.
+    A CAS conflict transitions the replica to PREEMPTED.
+    This spec uses the PREEMPTED state to avoid an 
+    infinite battle between replicas. In reality, it would
+    cause the writer to stop and reopen.
+    On write success, the writer transitions back to READY
+    to be able to accept another write. Also the written
+    fragment entries are recorded in auxCommitted for 
+    invariant checking.
 -----------------------------------------------------------*)
 
 WalCommitFragment(r) ==
@@ -162,6 +203,18 @@ WalCommitFragment(r) ==
                    auxUsedValues, repCompVars,
                    rGcCachedPlan, rGcPinnedPlan, rGcTrimLimit, rGcCompCursor>>
 
+\* ****************************************************
+\* Init, Next and Fairness
+\* ****************************************************
+
+WriterInit ==
+    /\ rWriterState = [r \in Replicas |-> IDLE]
+    /\ rWriterPendingValues = [r \in Replicas |-> {}]
+    /\ rWriterFragment = [r \in Replicas |-> None]
+    /\ rWriterNextPos = [r \in Replicas |-> 0]
+    /\ rWriterNextSeqNo = [r \in Replicas |-> 0]
+
+\* The next state actions of the WAL writer
 WriterNext(r) ==
     \/ WalRefreshManifest(r)
     \/ WalRecover(r)
@@ -169,5 +222,13 @@ WriterNext(r) ==
     \/ \E values \in SUBSET Values : WalAcceptWrites(r, values)
     \/ WalUploadFragment(r)
     \/ WalCommitFragment(r)
+
+WriterFairness(r) ==
+    /\ WF_vars(WalRefreshManifest(r))
+    /\ WF_vars(WalRecover(r))
+    /\ WF_vars(WalCommitRecoveredFragment(r))
+    /\ \A values \in SUBSET Values : WF_vars(WalAcceptWrites(r, values))
+    /\ WF_vars(WalUploadFragment(r))
+    /\ WF_vars(WalCommitFragment(r))
 
 =============================================================================

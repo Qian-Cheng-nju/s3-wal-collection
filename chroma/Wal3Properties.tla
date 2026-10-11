@@ -29,17 +29,20 @@ ValidFragments ==
         /\ i + 1 = j
         /\ manifest.fragRefs[i].limit /= manifest.fragRefs[j].start
         /\ manifest.fragRefs[i].seqNo + 1 = manifest.fragRefs[j].seqNo
-    \* Fragment entries are contiguous across fragment files
-    /\ ~\E id1, id2 \in DOMAIN fragments :
-        /\ id1 + 1 = id2
-        /\ MaxLogPos(fragments[id1]) + 1 /= MinLogPos(fragments[id2])
-        /\ fragments[id1].seqNo + 1 = fragments[id2].seqNo
-    \* Fragment refs point to written fragment addresses and their bounds match
+    \* Fragment refs point to written fragment addresses and their 
+    \* bounds match
     /\ \A i \in DOMAIN manifest.fragRefs :
-        LET ref == manifest.fragRefs[i] IN
+        LET ref  == manifest.fragRefs[i]
+            frag == fragments[ref.seqNo]
+        IN
+            \* fragment exists
             /\ ref.seqNo \in DOMAIN fragments
+            \* bounds match
             /\ ref.start = MinLogPos(fragments[ref.seqNo])
             /\ ref.limit -1 = MaxLogPos(fragments[ref.seqNo])
+            \* positions are sequential
+            /\ \A j \in 1..Len(frag.entries)-1 :
+                frag.entries[j].pos + 1 = frag.entries[j+1].pos
 
 \* INV: ConsistentCheckpoint
 \* If the checkpoint is stale, it matches a prefix of write history.
