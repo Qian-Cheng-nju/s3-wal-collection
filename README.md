@@ -35,6 +35,7 @@ So far.
 | [Objwal](/jay-jamieson-objwal/ObjWAL.tla) | [Description](jay-jamieson-objwal/ObjWAL_notes.md) | [GitHub](https://github.com/JayJamieson/objwal) | — |
 | [Shared Storage Consensus](s2c/S2C.tla) | [Description](s2c/S2C_notes.md) | [GitHub](https://github.com/io-s2c/s2c) | — |
 | [Shared Storage Consensus, fencing variant](s2c/S2CFencing.tla) | [Description](s2c/S2CFencing_notes.md) | — | The variant fixes a somewhat theoretical consistency bug in S2C |
+| [Chroma, wal3](chroma/Wal3.tla) | [Description](chroma/Wal3_notes.md) | [GitHub](https://github.com/chroma-core/chroma/tree/main/rust/wal3)| — |
 
 ### Category 2: Multi-writer WALs
 
@@ -56,7 +57,6 @@ The following are a set of projects that must be evaluated to see if they qualif
 * Robert Pitt's git3: https://github.com/robertpitt/git3
 * OpenData Log
 * UnisonDB WAL: https://github.com/ankur-anand/unisondb/tree/main/pkg/walfs
-* wal3 chroma https://www.trychroma.com/engineering/wal3
 * https://lance.org/format/table/mem_wal/
 * https://github.com/rockwotj/chorus
 * https://github.com/ankur-anand/objlog
