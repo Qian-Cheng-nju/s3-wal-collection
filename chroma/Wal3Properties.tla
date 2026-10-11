@@ -12,12 +12,10 @@ Symmetry ==
 
 \* INV: ValidReplicas
 \* Preemption applies to writer and GC at the same time
-\* There must be at least one functional wal writer
-\* and no wal writer entered an illegal state
+\* There must be at least one functional wal writer.
 ValidReplicas ==
     /\ \A r \in Replicas :
-        /\ rWriterState[r] = PREEMPTED => rGcState[r] = PREEMPTED
-        /\ rWriterState[r] /= ILLEGAL_STATE
+        rWriterState[r] = PREEMPTED => rGcState[r] = PREEMPTED
     /\ \E r \in Replicas : rWriterState[r] /= PREEMPTED
     
 \* INV: ValidFragments

@@ -12,7 +12,7 @@
     This is a simplified model of Chroma's Wal3 protocol.
     Chroma DB state is represented by a checkpoint
     variable and the WAL is simplified based only
-    on fragments (no snapshots).
+    on fragments (no WAL snapshots).
 *)
 
 EXTENDS Wal3Writer, Wal3GC, Wal3Compactor, Wal3Properties

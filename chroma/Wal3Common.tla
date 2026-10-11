@@ -16,9 +16,8 @@ CONSTANTS Replicas, \* The set of replica processes
           Values   \* The set of values to append
 
 \* Replica states
-CONSTANTS IDLE, RECOVER, COMMIT_RECOVERED, REFRESH, READY,
-          UPLOAD_FRAGMENT, COMMIT_FRAGMENT,
-          ILLEGAL_STATE, ABORT_WRITE, PREEMPTED,
+CONSTANTS IDLE, PROBE_NEXT, COMMIT_RECOVERED, REFRESH, READY,
+          UPLOAD_FRAGMENT, COMMIT_FRAGMENT, PREEMPTED,
           REPLAY_WAL, COMMIT_CHECKPOINT, READ_CURSOR, COMMIT_CURSOR,
           GC_P1_READ_GC_FILE, GC_P1_COMPUTE_PLAN,
           GC_P2_READ_GC_FILE, GC_P2_CAS_MANIFEST,
@@ -110,9 +109,8 @@ GcPlanType == [seqNoLimit: Nat, version: Nat] \union {None}
 CompactionCursorType == [pos: Nat, version: Nat] \union {None}
 
 \* role states
-WriterStates == {IDLE, REFRESH, RECOVER, COMMIT_RECOVERED, READY,
-                 UPLOAD_FRAGMENT, COMMIT_FRAGMENT, ABORT_WRITE,
-                 ILLEGAL_STATE, PREEMPTED}
+WriterStates == {IDLE, REFRESH, PROBE_NEXT, COMMIT_RECOVERED, READY,
+                 UPLOAD_FRAGMENT, COMMIT_FRAGMENT, PREEMPTED}
 GcStates == {IDLE, ABORTED, PREEMPTED,
              GC_P1_READ_GC_FILE, GC_P1_COMPUTE_PLAN,
              GC_P2_READ_GC_FILE, GC_P2_CAS_MANIFEST,
